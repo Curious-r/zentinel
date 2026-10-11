@@ -37,9 +37,9 @@ Zentinel supports automatic TLS certificate management using the ACME protocol (
 │  ┌──────────────────────────────────────────────────────────────┐  │
 │  │                   RenewalScheduler                            │  │
 │  │                                                               │  │
-│  │  Background task checking certificates every 12 hours         │  │
-│  │  Triggers renewal when within renew_before_days of expiry     │  │
-│  │  Supports both HTTP-01 and DNS-01 renewal flows               │  │
+│  │  Event-driven deadline loop (ARI refresh & renewal deadlines) │  │
+│  │  RFC 9773 ARI renewal windows with renew_before_days fallback │  │
+│  │  Supports both HTTP-01 and DNS-01 renewal with replaces       │  │
 │  └──────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -51,15 +51,28 @@ Zentinel supports automatic TLS certificate management using the ACME protocol (
 Module exports and public API:
 
 ```rust
+pub use ari::{AriCapability, AriError, AriErrorClassification, RenewalWindow};
 pub use challenge::ChallengeManager;
 pub use client::AcmeClient;
 pub use error::AcmeError;
 pub use scheduler::RenewalScheduler;
 pub use storage::CertificateStorage;
 
-// DNS-01 challenge support
+// ARI and DNS-01 challenge support
+pub mod ari;
 pub mod dns;
 ```
+
+### `acme/ari.rs` - RFC 9773 ACME Renewal Information (ARI)
+
+Implements RFC 9773 ACME Renewal Information (ARI) support for CA-guided certificate renewal and predecessor replacement:
+
+- **Certificate Identification**: Extracts RFC 9773 unique certificate identifiers (`{authorityKeyIdentifier}.{serialNumber}`) from leaf certificates.
+- **Renewal Window Scheduling**: Validates CA-provided suggested renewal windows (`suggestedWindow`), uniformly samples a renewal time across the full window per RFC 9773 §4.2, preserves future selections across refreshes when the window is unchanged, and resamples across the entire new window when it changes.
+- **Refresh Lifecycle**: Polls the CA for renewal info according to the server's `Retry-After` hint (clamped between 1 minute and 24 hours per RFC 9773 §4.3.2).
+- **Error Recovery & Backoff**: Follows RFC 9773 §4.3.3 with bounded exponential backoff for temporary failures and ~6-hour retry intervals for long-term errors.
+- **Capability Detection & Fallback**: Distinguishes supported, unsupported, and unknown/transient ARI states. When ARI is explicitly unsupported or unavailable, automatically falls back to the configured `renew-before-days` policy.
+- **Order Linking (`replaces`)**: Automatically associates renewal orders with their predecessor certificates via `NewOrder::replaces()` when ARI support is confirmed.
 
 ### `acme/dns/` - DNS-01 Challenge Support
 
@@ -210,12 +223,25 @@ Key methods:
 
 ### `acme/scheduler.rs`
 
-The `RenewalScheduler` runs as a background task:
+The `RenewalScheduler` runs as a background task orchestrating renewal timing, ARI refresh scheduling, fallback policy, and TLS hot-reload:
 
-- Default check interval: 12 hours (configurable, minimum 1 hour)
-- Initial check after 10 second startup delay
-- Triggers renewal when certificate expires within `renew_before_days`
-- Triggers TLS hot-reload after successful renewal
+- **Event-Driven Deadline Loop**: Uses dynamic sleep intervals (`next_wakeup`) to trigger at the earliest of the effective ARI renewal deadline, the next ARI refresh deadline, or the fallback polling interval (default 12 hours, minimum 1 hour).
+- **ARI Renewal Windows (RFC 9773 §4.2)**: When supported by the CA, renewal timing is selected uniformly at random across the full CA-suggested renewal window (`[suggestedWindow.start, suggestedWindow.end]`), without intersecting it with any previous window. If the selected renewal time is already in the past (e.g., when the suggested window has fully elapsed or the sampled time falls before the current moment), renewal becomes immediately due; otherwise, renewal remains scheduled for the selected future time. An unchanged window preserves its existing selection while that selection remains in the future.
+- **Minimum Certificate Age Cooldown**: Enforces an `ARI_MIN_CERTIFICATE_AGE` cooldown (24 hours) on ARI-triggered renewals to prevent tight renewal loops on CA windows that immediately request renewal for freshly issued certificates. Even if an ARI window or selected time has already passed, the cooldown defers ARI renewal until the certificate is at least 24 hours old. This cooldown survives process restarts via certificate metadata (`meta.issued`) and is clamped in `effective_renewal_deadline` to avoid premature scheduler wakeups.
+- **Independent Expiry Safeguard**: Expiry-based renewal (`renew-before-days`) operates independently of ARI. While ARI can trigger renewal earlier than the configured threshold, a late or pathological CA window can never delay or suppress expiry-based renewal. Furthermore, expiry-based renewal is exempt from the 24-hour certificate-age cooldown, guaranteeing that certificates nearing expiration are always renewed.
+- **Refresh Lifecycle & `Retry-After`**: Periodically refreshes renewal information using the CA server's `Retry-After` hint to discover changes to the renewal window. Refresh intervals are clamped between 1 minute and 24 hours (RFC 9773 §4.3.2). Upcoming refreshes never delay an already-due renewal. When the suggested window changes, any CA-provided `explanationURL` is surfaced in logs.
+- **Fallback Policy (`renew-before-days`)**: Not all ACME servers support ARI. When ARI is explicitly unsupported, or when ARI information is temporarily unavailable and no cached window exists, Zentinel continues using the configured `renew-before-days` policy.
+- **Error Recovery & Backoff (RFC 9773 §4.3.3)**:
+  - Every refresh failure either schedules a future retry or clears obsolete deadlines; no overdue refresh is left in the past to prevent tight wakeup loops.
+  - Temporary failures (timeouts, network errors, 5xx responses) trigger bounded exponential backoff (1m for 1st failure, 2m for 2nd, 4m for 3rd).
+  - Exhausted retries (>3 consecutive failures) transition to a long-term retry schedule (~6 hours).
+  - Long-term errors (non-5xx HTTP responses including 404, connection refused, DNS resolution failures, invalid `suggestedWindow` where `end <= start`) schedule long-term retries (~6 hours) without tight polling.
+  - **HTTP status classification & dependency boundary**: `instant-acme 0.8.5` parses Problem JSON (RFC 7807/RFC 8555) and exposes `problem.status: Option<u16>` as deserialized from the response body; the raw transport-level HTTP status code header is not retained by the library when Problem `status` is absent or when responses fail Problem parsing (such as HTML error pages or missing `Retry-After`). Responses containing `status: 500..=599` are classified as temporary; non-5xx (including 404), omitted Problem `status`, missing `Retry-After`, and unparseable problem responses fall back conservatively to long-term errors (~6 hours). Crucially, none of these are mistaken for explicit ARI capability detection; only explicit `instant_acme::Error::Unsupported` marks ARI capability as `Unsupported`.
+  - Explicit unsupported status (`instant_acme::Error::Unsupported`) switches capability to `Unsupported`, clears stale ARI windows, and activates `renew-before-days` fallback.
+  - Expired or missing certificates clear obsolete ARI state and fall back directly to immediate renewal / fallback thresholds.
+  - Transient refresh failures preserve any previously cached valid window and renewal deadline for the active certificate.
+- **Order Linking with `replaces`**: When a valid predecessor certificate exists, its identifier can be extracted, and the CA supports ARI, renewal orders include `replaces(cert_id)` for both HTTP-01 and DNS-01 flows. If order creation with `replaces` fails (e.g., `alreadyReplaced` or other CA rejection), the scheduler makes exactly one bounded fallback attempt to order without `replaces`. Fallback failure returns an error immediately without looping, and CA rejection of `replaces` does not downgrade ARI capability to `Unsupported`.
+- **Active Certificate Identity**: After renewal succeeds, the scheduler switches to tracking the newly issued certificate, invalidates predecessor scheduling state, and promptly requests ARI for the new certificate.
 
 ### `acme/error.rs`
 
@@ -237,6 +263,8 @@ pub enum AcmeError {
     CertificateParse(String),
     Timeout(String),
     Storage(StorageError),
+    Ari(AriError),                     // RFC 9773 ARI errors
+    Unsupported(&'static str),         // ACME feature unsupported (e.g. ARI)
 }
 ```
 

@@ -13,14 +13,15 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use instant_acme::{
-    Account, AuthorizationStatus, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder,
-    Order, OrderStatus, RetryPolicy,
+    Account, AccountBuilder, AuthorizationStatus, CertificateIdentifier, ChallengeType, Identifier,
+    LetsEncrypt, NewAccount, NewOrder, Order, OrderStatus, RenewalInfo, RetryPolicy,
 };
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, trace, warn};
 
 use zentinel_config::server::AcmeConfig;
 
+use super::ari::{self, AriError};
 use super::dns::challenge::{create_challenge_info, Dns01ChallengeInfo};
 use super::error::{is_retryable_acme_error, AcmeError, ACME_RETRY_BACKOFF, ACME_RETRY_MAX};
 use super::storage::{CertificateStorage, StoredAccountCredentials};
@@ -78,6 +79,8 @@ pub struct AcmeClient {
     config: AcmeConfig,
     /// Certificate storage
     storage: Arc<CertificateStorage>,
+    /// Optional custom HTTP client factory for testing with mock servers.
+    custom_http: Option<Arc<dyn Fn() -> Box<dyn instant_acme::HttpClient> + Send + Sync>>,
 }
 
 impl AcmeClient {
@@ -92,7 +95,17 @@ impl AcmeClient {
             account: Arc::new(RwLock::new(None)),
             config,
             storage,
+            custom_http: None,
         }
+    }
+
+    /// Set a custom HTTP client factory for testing with mock ACME servers.
+    pub fn with_custom_http<F>(mut self, factory: F) -> Self
+    where
+        F: Fn() -> Box<dyn instant_acme::HttpClient> + Send + Sync + 'static,
+    {
+        self.custom_http = Some(Arc::new(factory));
+        self
     }
 
     /// Get the ACME configuration
@@ -140,6 +153,14 @@ impl AcmeClient {
         self.init_account().await
     }
 
+    fn account_builder(&self) -> Result<AccountBuilder, AcmeError> {
+        if let Some(ref factory) = self.custom_http {
+            Ok(Account::builder_with_http(factory()))
+        } else {
+            Account::builder().map_err(|e| AcmeError::AccountCreation(e.to_string()))
+        }
+    }
+
     async fn init_account_once(&self) -> Result<(), AcmeError> {
         // Check for existing account credentials (stored as JSON)
         if let Some(creds_json) = self.storage.load_credentials_json()? {
@@ -152,8 +173,8 @@ impl AcmeClient {
             })?;
 
             // Reconstruct account from stored credentials
-            let account = Account::builder()
-                .map_err(|e| AcmeError::AccountCreation(e.to_string()))?
+            let account = self
+                .account_builder()?
                 .from_credentials(credentials)
                 .await
                 .map_err(|e| AcmeError::AccountCreation(e.to_string()))?;
@@ -183,8 +204,8 @@ impl AcmeClient {
             None
         };
 
-        let (account, credentials) = Account::builder()
-            .map_err(|e| AcmeError::AccountCreation(e.to_string()))?
+        let (account, credentials) = self
+            .account_builder()?
             .create(
                 &NewAccount {
                     contact: &[&format!("mailto:{}", self.config.email)],
@@ -214,15 +235,30 @@ impl AcmeClient {
     /// Creates a new certificate order and returns it along with the
     /// authorization challenges that need to be completed.
     ///
+    /// # Arguments
+    ///
+    /// * `replaces` - Optional RFC 9773 predecessor certificate identifier
+    ///
     /// # Returns
     ///
     /// A tuple of (Order, Vec<`ChallengeInfo`>) containing the order and
     /// HTTP-01 challenge information for each domain.
-    pub async fn create_order(&self) -> Result<(Order, Vec<ChallengeInfo>), AcmeError> {
-        retry_acme(|| async { self.create_order_once().await }).await
+    pub async fn create_order(
+        &self,
+        replaces: Option<&CertificateIdentifier<'_>>,
+    ) -> Result<(Order, Vec<ChallengeInfo>), AcmeError> {
+        let replaces_owned = replaces.cloned();
+        retry_acme(|| {
+            let r = replaces_owned.clone();
+            async move { self.create_order_once(r.as_ref()).await }
+        })
+        .await
     }
 
-    async fn create_order_once(&self) -> Result<(Order, Vec<ChallengeInfo>), AcmeError> {
+    async fn create_order_once(
+        &self,
+        replaces: Option<&CertificateIdentifier<'_>>,
+    ) -> Result<(Order, Vec<ChallengeInfo>), AcmeError> {
         let account_guard = self.account.read().await;
         let account = account_guard.as_ref().ok_or(AcmeError::NoAccount)?;
 
@@ -234,13 +270,22 @@ impl AcmeClient {
             .map(|d: &String| Identifier::Dns(d.clone()))
             .collect();
 
-        info!(domains = ?self.config.domains, "Creating certificate order");
+        info!(
+            domains = ?self.config.domains,
+            replaces = ?replaces.map(|r| r.to_string()),
+            "Creating certificate order"
+        );
 
         // Create the order
-        let mut order = account
-            .new_order(&NewOrder::new(&identifiers))
-            .await
-            .map_err(|e| AcmeError::OrderCreation(e.to_string()))?;
+        let mut new_order = NewOrder::new(&identifiers);
+        if let Some(replaces_id) = replaces {
+            new_order = new_order.replaces(replaces_id.clone());
+        }
+
+        let mut order = account.new_order(&new_order).await.map_err(|e| match e {
+            instant_acme::Error::Unsupported(feature) => AcmeError::Unsupported(feature),
+            other => AcmeError::OrderCreation(other.to_string()),
+        })?;
 
         // Get authorizations and extract HTTP-01 challenges
         let mut authorizations = order.authorizations();
@@ -248,7 +293,7 @@ impl AcmeClient {
 
         while let Some(result) = authorizations.next().await {
             let mut authz = result.map_err(|e| {
-                AcmeError::OrderCreation(format!("Failed to get authorization: {}", e))
+                AcmeError::Authorization(format!("Failed to get authorization: {}", e))
             })?;
 
             let identifier = authz.identifier();
@@ -288,15 +333,30 @@ impl AcmeClient {
     /// Creates a new certificate order and returns it along with the
     /// DNS-01 challenge information for each domain.
     ///
+    /// # Arguments
+    ///
+    /// * `replaces` - Optional RFC 9773 predecessor certificate identifier
+    ///
     /// # Returns
     ///
     /// A tuple of (Order, Vec<`Dns01ChallengeInfo`>) containing the order and
     /// DNS-01 challenge information for each domain.
-    pub async fn create_order_dns01(&self) -> Result<(Order, Vec<Dns01ChallengeInfo>), AcmeError> {
-        retry_acme(|| async { self.create_order_dns01_once().await }).await
+    pub async fn create_order_dns01(
+        &self,
+        replaces: Option<&CertificateIdentifier<'_>>,
+    ) -> Result<(Order, Vec<Dns01ChallengeInfo>), AcmeError> {
+        let replaces_owned = replaces.cloned();
+        retry_acme(|| {
+            let r = replaces_owned.clone();
+            async move { self.create_order_dns01_once(r.as_ref()).await }
+        })
+        .await
     }
 
-    async fn create_order_dns01_once(&self) -> Result<(Order, Vec<Dns01ChallengeInfo>), AcmeError> {
+    async fn create_order_dns01_once(
+        &self,
+        replaces: Option<&CertificateIdentifier<'_>>,
+    ) -> Result<(Order, Vec<Dns01ChallengeInfo>), AcmeError> {
         let account_guard = self.account.read().await;
         let account = account_guard.as_ref().ok_or(AcmeError::NoAccount)?;
 
@@ -308,13 +368,22 @@ impl AcmeClient {
             .map(|d: &String| Identifier::Dns(d.clone()))
             .collect();
 
-        info!(domains = ?self.config.domains, "Creating certificate order with DNS-01 challenges");
+        info!(
+            domains = ?self.config.domains,
+            replaces = ?replaces.map(|r| r.to_string()),
+            "Creating certificate order with DNS-01 challenges"
+        );
 
         // Create the order
-        let mut order = account
-            .new_order(&NewOrder::new(&identifiers))
-            .await
-            .map_err(|e| AcmeError::OrderCreation(e.to_string()))?;
+        let mut new_order = NewOrder::new(&identifiers);
+        if let Some(replaces_id) = replaces {
+            new_order = new_order.replaces(replaces_id.clone());
+        }
+
+        let mut order = account.new_order(&new_order).await.map_err(|e| match e {
+            instant_acme::Error::Unsupported(feature) => AcmeError::Unsupported(feature),
+            other => AcmeError::OrderCreation(other.to_string()),
+        })?;
 
         // Get authorizations and extract DNS-01 challenges
         let mut authorizations = order.authorizations();
@@ -322,7 +391,7 @@ impl AcmeClient {
 
         while let Some(result) = authorizations.next().await {
             let mut authz = result.map_err(|e| {
-                AcmeError::OrderCreation(format!("Failed to get authorization: {}", e))
+                AcmeError::Authorization(format!("Failed to get authorization: {}", e))
             })?;
 
             let identifier = authz.identifier();
@@ -354,6 +423,27 @@ impl AcmeClient {
         }
 
         Ok((order, challenges))
+    }
+
+    /// Extract RFC 9773 certificate identifier from a PEM certificate chain
+    pub fn extract_certificate_identifier(
+        &self,
+        cert_pem: &str,
+    ) -> Result<CertificateIdentifier<'static>, AcmeError> {
+        super::ari::extract_certificate_identifier(cert_pem)
+    }
+
+    /// Request ARI renewal information for an identified certificate (RFC 9773 §4.2)
+    pub async fn renewal_info(
+        &self,
+        certificate_id: &CertificateIdentifier<'_>,
+    ) -> Result<(RenewalInfo, Duration), AriError> {
+        let account_guard = self.account.read().await;
+        let account = account_guard.as_ref().ok_or(AriError::NoAccount)?;
+        account
+            .renewal_info(certificate_id)
+            .await
+            .map_err(AriError::Protocol)
     }
 
     /// Notify the ACME server that a challenge is ready for validation
@@ -620,6 +710,110 @@ impl std::fmt::Debug for AcmeClient {
                     .map(|a| a.is_some())
                     .unwrap_or(false),
             )
+            .field("has_custom_http", &self.custom_http.is_some())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zentinel_config::server::{AcmeChallengeType, AcmeKeyType};
+
+    #[tokio::test]
+    async fn test_default_client_rejects_plaintext_http_url() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mock = wiremock::MockServer::start().await;
+        let base = mock.uri();
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/directory"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "newNonce": format!("{base}/new-nonce"),
+                    "newAccount": format!("{base}/new-account"),
+                    "newOrder": format!("{base}/new-order"),
+                })),
+            )
+            .mount(&mock)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("HEAD"))
+            .and(wiremock::matchers::path("/new-nonce"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).insert_header("replay-nonce", "test-nonce-1"),
+            )
+            .mount(&mock)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/new-account"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201)
+                    .insert_header("replay-nonce", "test-nonce-2")
+                    .insert_header("location", format!("{base}/account/1"))
+                    .set_body_json(serde_json::json!({"status": "valid"})),
+            )
+            .mount(&mock)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(CertificateStorage::new(temp_dir.path()).unwrap());
+        let config = AcmeConfig {
+            email: "test@example.com".to_string(),
+            domains: vec!["example.com".to_string()],
+            server_url: Some(format!("{base}/directory")),
+            staging: false,
+            eab: None,
+            storage: temp_dir.path().to_path_buf(),
+            renew_before_days: 30,
+            challenge_type: AcmeChallengeType::Http01,
+            key_type: AcmeKeyType::EcdsaP256,
+            dns_provider: None,
+        };
+
+        // 1. Construct client using default production path (no custom HTTP injected)
+        let client = AcmeClient::new(config.clone(), Arc::clone(&storage));
+        assert!(client.custom_http.is_none());
+
+        // 2. Default client must fail because the default production transport does not permit plaintext HTTP
+        let result = client.init_account().await;
+        assert!(
+            result.is_err(),
+            "Default production client must fail when pointed at a plaintext HTTP directory"
+        );
+        assert!(
+            client.account.read().await.is_none(),
+            "Default client account must not be initialized over plaintext HTTP"
+        );
+
+        // 3. Inspect received requests: no account creation must have been performed over plaintext HTTP
+        let received = mock.received_requests().await.unwrap();
+        let account_reqs = received
+            .iter()
+            .filter(|r| r.url.path() == "/new-account")
+            .count();
+        assert_eq!(
+            account_reqs, 0,
+            "Default client must not perform account creation over plaintext HTTP"
+        );
+
+        // 4. Counter-proof: prove the mock server was live, reachable, and valid.
+        // When a plaintext-capable HTTP client is explicitly injected, account creation succeeds against the exact same endpoints.
+        let test_client = AcmeClient::new(config, storage).with_custom_http(|| {
+            let connector = hyper_util::client::legacy::connect::HttpConnector::new();
+            let hyper_client: hyper_util::client::legacy::Client<
+                hyper_util::client::legacy::connect::HttpConnector,
+                instant_acme::BodyWrapper<bytes::Bytes>,
+            > = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build(connector);
+            Box::new(hyper_client)
+        });
+        let test_result = test_client.init_account().await;
+        assert!(
+            test_result.is_ok(),
+            "Explicit plaintext client must succeed against the live mock server, proving the mock was operational"
+        );
+        assert!(test_client.account.read().await.is_some());
     }
 }

@@ -29,6 +29,10 @@ pub enum AcmeError {
     #[error("Failed to create certificate order: {0}")]
     OrderCreation(String),
 
+    /// Failed to retrieve or process order authorizations
+    #[error("Failed to process order authorization: {0}")]
+    Authorization(String),
+
     /// Challenge validation failed
     #[error("Challenge validation failed for domain '{domain}': {message}")]
     ChallengeValidation { domain: String, message: String },
@@ -76,6 +80,26 @@ pub enum AcmeError {
     /// Certificate parsing error
     #[error("Failed to parse certificate: {0}")]
     CertificateParse(String),
+
+    /// ACME Renewal Information (ARI) error
+    #[error("ARI error: {0}")]
+    Ari(#[from] super::ari::AriError),
+
+    /// ACME feature unsupported (e.g. replaces or renewalInfo)
+    #[error("ACME feature unsupported: {0}")]
+    Unsupported(&'static str),
+}
+
+impl AcmeError {
+    /// Check whether this error represents a failure during the ACME order-creation step
+    /// (the `newOrder` request itself), as opposed to subsequent processing of an
+    /// already-created order (e.g. authorization retrieval or challenge extraction).
+    pub(crate) fn is_order_creation_error(&self) -> bool {
+        matches!(
+            self,
+            AcmeError::OrderCreation(_) | AcmeError::Unsupported(_)
+        )
+    }
 }
 
 /// Errors specific to certificate storage operations
@@ -110,7 +134,10 @@ impl From<serde_json::Error> for StorageError {
 
 impl From<instant_acme::Error> for AcmeError {
     fn from(e: instant_acme::Error) -> Self {
-        AcmeError::Protocol(e.to_string())
+        match e {
+            instant_acme::Error::Unsupported(feature) => AcmeError::Unsupported(feature),
+            other => AcmeError::Protocol(other.to_string()),
+        }
     }
 }
 
@@ -122,9 +149,11 @@ impl From<instant_acme::Error> for AcmeError {
 /// transport failures. Non-transient errors like auth/rate-limit
 /// or DNS propagation timeouts must fail fast.
 pub fn is_retryable_acme_error(e: &AcmeError) -> bool {
+    if let AcmeError::Ari(ari_err) = e {
+        return ari_err.is_temporary();
+    }
     // Never retry deterministic errors: storage/config, missing
-    // challenges, or polling timeouts (the latter is application-level
-    // "wait too long", not a transient transport failure).
+    // challenges, unsupported features, or polling timeouts.
     if matches!(
         e,
         AcmeError::Storage(_)
@@ -136,6 +165,7 @@ pub fn is_retryable_acme_error(e: &AcmeError) -> bool {
             | AcmeError::CertificateParse(_)
             | AcmeError::Timeout(_)
             | AcmeError::PropagationTimeout { .. }
+            | AcmeError::Unsupported(_)
     ) {
         return false;
     }
@@ -229,5 +259,21 @@ mod tests {
             retry_after_secs: 60,
         });
         assert!(!is_retryable_acme_error(&e));
+    }
+
+    #[test]
+    fn test_is_order_creation_error() {
+        assert!(AcmeError::OrderCreation("CA rejected order".to_string()).is_order_creation_error());
+        assert!(AcmeError::Unsupported("replaces").is_order_creation_error());
+        assert!(!AcmeError::Authorization("authz failed".to_string()).is_order_creation_error());
+        assert!(!AcmeError::NoHttp01Challenge("example.com".to_string()).is_order_creation_error());
+        assert!(!AcmeError::NoDns01Challenge("example.com".to_string()).is_order_creation_error());
+        assert!(!AcmeError::ChallengeValidation {
+            domain: "example.com".to_string(),
+            message: "invalid".to_string(),
+        }
+        .is_order_creation_error());
+        assert!(!AcmeError::Finalization("csr rejected".to_string()).is_order_creation_error());
+        assert!(!AcmeError::NoAccount.is_order_creation_error());
     }
 }
